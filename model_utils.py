@@ -482,8 +482,9 @@ class ProteinModel(nn.Module):
         ####################################################################
         # Jacob
         if compute_categorical_jacobian:
-            L = h_V.shape[1]
-            J = torch.zeros((L, L), device=device)
+            B, L = h_V.shape[:2]
+            J = torch.zeros((B, L, L), device=h_V.device)
+            print("Starting to compute Jacobian")
             for i in range(L):
                 X_prime = X.clone()
                 X_prime[:, i, :, :] = X_prime[:, i, :, :] + categorical_jacobian_eps
@@ -495,7 +496,8 @@ class ProteinModel(nn.Module):
 
                 # Compute categorical Jacobian
                 J_row = torch.linalg.vector_norm(h_V_prime - h_V, dim=-1) / categorical_jacobian_eps # [B, L]
-                J[i, :] = J_row
+                J[:, i, :] = J_row
+            print("Finished computing Jacobian")
         ####################################################################
 
         # Concatenate sequence embeddings for autoregressive decoder

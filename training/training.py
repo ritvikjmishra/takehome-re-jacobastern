@@ -71,8 +71,15 @@ def training_loop(
             ########################################################
             # Jacob
             if i == 0:
-                log_probs, cat_jac = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, compute_categorical_jacobian=True)
+                first_non_zero_coord = 10
+                max_jacobian_size = 5
+                _, cat_jac = model(X[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], S[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], mask[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], chain_M[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], residue_idx[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], chain_encoding_all[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], compute_categorical_jacobian=True)
+                cat_jac_pdb_ids = [item["name"] for item in batch]
+                # Make contact map from X
+                dist = torch.norm(X[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size, None, 0, :3] - X[:, None, first_non_zero_coord:first_non_zero_coord + max_jacobian_size, 0, :3], dim=-1)
+                cat_jac_contact_maps = dist < 10.0
             ########################################################
+            log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
             mask_for_loss = mask*chain_M
             loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
 
@@ -100,10 +107,15 @@ def training_loop(
     
     # visualize categorical jacobian
     np.save(base_folder + f'categorical_jacobian_epoch_{e}.npy', cat_jac)
-    plt.imshow(cat_jac[0, 0, :, :])
-    plt.colorbar()
-    plt.savefig(base_folder + f'categorical_jacobian_epoch_{e}.png')
-    plt.close()
+    for i in range(len(cat_jac)):
+        # Display categorical jacobian next to contact map
+        fig, ax = plt.subplots(1, 2)
+        ax[0].imshow(cat_jac[i])
+        ax[0].set_title(f'Categorical Jacobian for PDB {cat_jac_pdb_ids[i]}')
+        ax[1].imshow(cat_jac_contact_maps[i])
+        ax[1].set_title(f'Contact Map for PDB {cat_jac_pdb_ids[i]}')
+        plt.savefig(base_folder + f'categorical_jacobian_epoch_{e}_pdb_{cat_jac_pdb_ids[i]}.png')
+
 
     checkpoint_filename_last = base_folder+'model_weights/epoch_last.pt'.format(e+1, total_step)
     torch.save({
