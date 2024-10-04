@@ -27,8 +27,9 @@ class MyArgs(object):
     self.rescut = 3.5
     self.debug = False
     self.gradient_norm = -1.0 #no norm
-    self.decoder_use_full_cross_attention = False
+    self.decoder_use_full_cross_attention = True
     self.cross_attention_num_heads = 4
+    self.mixed_precision = False
 
 
 if __name__ == "__main__":
