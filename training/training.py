@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import random
 import os.path
 import subprocess
+import matplotlib.pyplot as plt
 from concurrent.futures import ProcessPoolExecutor
 from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader
 from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinModel
@@ -35,7 +36,7 @@ def training_loop(
     model.train()
     train_sum, train_weights = 0., 0.
     train_acc = 0.
-
+    # breakpoint()
     for _, batch in enumerate(loader_train):
         start_batch = time.time()
         X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
@@ -65,9 +66,13 @@ def training_loop(
     with torch.no_grad():
         validation_sum, validation_weights = 0., 0.
         validation_acc = 0.
-        for _, batch in enumerate(loader_valid):
+        for i, batch in enumerate(loader_valid):
             X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
-            log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+            ########################################################
+            # Jacob
+            if i == 0:
+                log_probs, cat_jac = model(X, S, mask, chain_M, residue_idx, chain_encoding_all, compute_categorical_jacobian=True)
+            ########################################################
             mask_for_loss = mask*chain_M
             loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
 
@@ -92,6 +97,13 @@ def training_loop(
     with open(logfile, 'a') as f:
         f.write(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}\n')
     print(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}')
+    
+    # visualize categorical jacobian
+    np.save(base_folder + f'categorical_jacobian_epoch_{e}.npy', cat_jac)
+    plt.imshow(cat_jac[0, 0, :, :])
+    plt.colorbar()
+    plt.savefig(base_folder + f'categorical_jacobian_epoch_{e}.png')
+    plt.close()
 
     checkpoint_filename_last = base_folder+'model_weights/epoch_last.pt'.format(e+1, total_step)
     torch.save({
@@ -178,7 +190,9 @@ def main(args):
                         num_decoder_layers=args.num_encoder_layers, 
                         k_neighbors=args.num_neighbors, 
                         dropout=args.dropout, 
-                        augment_eps=args.backbone_noise)
+                        augment_eps=args.backbone_noise,
+                        decoder_use_full_cross_attention=args.decoder_use_full_cross_attention,
+                        cross_attention_num_heads=args.cross_attention_num_heads)
     model.to(device)
 
 
