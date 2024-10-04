@@ -229,7 +229,7 @@ class EncLayer(nn.Module):
 
 
 class DecLayer(nn.Module):
-    def __init__(self, num_hidden, num_in, dropout=0.1, num_heads=None, scale=30):
+    def __init__(self, num_hidden, num_in, dropout=0.1, scale=30, decoder_use_full_cross_attention=False, cross_attention_num_heads=None):
         super(DecLayer, self).__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
@@ -239,25 +239,64 @@ class DecLayer(nn.Module):
         self.norm1 = nn.LayerNorm(num_hidden)
         self.norm2 = nn.LayerNorm(num_hidden)
 
-        self.W1 = nn.Linear(num_hidden + num_in, num_hidden, bias=True)
-        self.W2 = nn.Linear(num_hidden, num_hidden, bias=True)
-        self.W3 = nn.Linear(num_hidden, num_hidden, bias=True)
-        self.act = torch.nn.GELU()
+        ###############################################################
+        # Jacob
+        self.num_heads = cross_attention_num_heads
+        self.decoder_use_full_cross_attention = decoder_use_full_cross_attention
+        if self.decoder_use_full_cross_attention:
+            self.dq = num_hidden // self.num_heads
+            self.dk = num_hidden // self.num_heads
+            self.dv = num_hidden // self.num_heads
+            self.num_heads = 4
+            self.proj_query = nn.Linear(num_hidden, self.num_heads * self.dq, bias=True)
+            self.proj_key = nn.Linear(num_in, self.num_heads * self.dk, bias=True)
+            self.proj_value = nn.Linear(num_in, self.num_heads * self.dv, bias=True)
+            self.proj_concat = nn.Linear(self.num_heads * self.dv, num_hidden, bias=True)
+            self.scale = np.sqrt(self.dk)
+        else:
+        ###############################################################
+            self.W1 = nn.Linear(num_hidden + num_in, num_hidden, bias=True)
+            self.W2 = nn.Linear(num_hidden, num_hidden, bias=True)
+            self.W3 = nn.Linear(num_hidden, num_hidden, bias=True)
+            self.act = torch.nn.GELU()
+            
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
     def forward(self, h_V, h_E, mask_V=None, mask_attend=None):
-        """ Parallel computation of full transformer layer """
+        """ Parallel computation of full transformer layer 
+        h_V (B, L, CV), h_E (B, L, K, CE)
+        """
+        ##################################################################
+        # Jacob
+        # This doesn't look like true attention. It doesn't use the interaction between h_V and h_E (i.e. dot product) 
+        # to weight the messages, meaning that the weights transforming h_E to h_message are fixed w.r.t. the input h_V.
+        # This is a degenerate case of attention where the attention weights are fixed w.r.t. the input
+        if self.decoder_use_full_cross_attention:
+            B, L, K, CE = h_E.shape
+            # Rewrite this as true cross-attention, with nodes as queries and edges as keys/values
+            h_V_query = self.proj_query(h_V).view(B, L, self.num_heads, self.dk).permute(0, 2, 1, 3) # [B, num_heads, L, dk]
+            h_E_key = self.proj_key(h_E).view(B, L, K, self.num_heads, self.dk).permute(0, 3, 1, 4, 2) # [B, num_heads, L, dk, K]
+            attn = torch.einsum('bhld,bhldk->bhlk', h_V_query, h_E_key) / self.scale # [B, num_heads, L, K]
+            # Attention masking is not necessary because this is cross-attention
+            attn = torch.nn.functional.softmax(attn, dim=-1) # [B, num_heads, L, K]
+            h_E_value = self.proj_value(h_E).view(B, L, K, self.num_heads, self.dv).permute(0, 3, 1, 2, 4) # [B, num_heads, L, K, dv]
+            h_V_update = torch.einsum('bhlk,bhlkd->bhld', attn, h_E_value) # [B, num_heads, L, dv]
+            # reshape and concat
+            h_V_update = h_V_update.permute(0, 2, 1, 3).reshape(B, L, self.num_heads * self.dv) # [B, L, num_heads * dv]
+            dh = self.proj_concat(h_V_update) # [B, L, CV]
 
-        # Concatenate h_V_i to h_E_ij
-        h_V_expand = h_V.unsqueeze(-2).expand(-1,-1,h_E.size(-2),-1)
-        h_EV = torch.cat([h_V_expand, h_E], -1)
+        else: # Use ProteinMPNN message passing
+        ##################################################################
+            # Concatenate h_V_i to h_E_ij
+            h_V_expand = h_V.unsqueeze(-2).expand(-1,-1,h_E.size(-2),-1) # [B, L, K, CV]
+            h_EV = torch.cat([h_V_expand, h_E], -1) # [B, L, K, CV + CE]
 
-        h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
-        if mask_attend is not None:
-            h_message = mask_attend.unsqueeze(-1) * h_message
-        dh = torch.sum(h_message, -2) / self.scale
+            h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV))))) # [B, L, K, CV]
+            if mask_attend is not None:
+                h_message = mask_attend.unsqueeze(-1) * h_message
+            dh = torch.sum(h_message, -2) / self.scale # [B, L, CV]
 
-        h_V = self.norm1(h_V + self.dropout1(dh))
+        h_V = self.norm1(h_V + self.dropout1(dh)) # [B, L, CV]
 
         # Position-wise feedforward
         dh = self.dense(h_V)
@@ -396,7 +435,7 @@ class ProteinFeatures(nn.Module):
 class ProteinModel(nn.Module):
     def __init__(self, num_letters=21, node_features=128, edge_features=128,
         hidden_dim=128, num_encoder_layers=3, num_decoder_layers=3,
-        vocab=21, k_neighbors=32, augment_eps=0.1, dropout=0.1):
+        vocab=21, k_neighbors=32, augment_eps=0.1, dropout=0.1, decoder_use_full_cross_attention=False, cross_attention_num_heads=4):
         super(ProteinModel, self).__init__()
 
         # Hyperparameters
@@ -417,7 +456,7 @@ class ProteinModel(nn.Module):
 
         # Decoder layers
         self.decoder_layers = nn.ModuleList([
-            DecLayer(hidden_dim, hidden_dim*3, dropout=dropout)
+            DecLayer(hidden_dim, hidden_dim*3, dropout=dropout, decoder_use_full_cross_attention=decoder_use_full_cross_attention, cross_attention_num_heads=cross_attention_num_heads)
             for _ in range(num_decoder_layers)
         ])
         self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
@@ -426,7 +465,7 @@ class ProteinModel(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all):
+    def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, compute_categorical_jacobian=False, categorical_jacobian_eps=1e-6):
         """ Graph-conditioned sequence model """
         device=X.device
         # Prepare node and edge embeddings
@@ -439,6 +478,25 @@ class ProteinModel(nn.Module):
         mask_attend = mask.unsqueeze(-1) * mask_attend
         for layer in self.encoder_layers:
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
+
+        ####################################################################
+        # Jacob
+        if compute_categorical_jacobian:
+            L = h_V.shape[1]
+            J = torch.zeros((L, L), device=device)
+            for i in range(L):
+                X_prime = X.clone()
+                X_prime[:, i, :, :] = X_prime[:, i, :, :] + categorical_jacobian_eps
+                E_prime, _ = self.features(X_prime, mask, residue_idx, chain_encoding_all)
+                h_V_prime = torch.zeros((E_prime.shape[0], E_prime.shape[1], E_prime.shape[-1]), device=E_prime.device)
+                h_E_prime = self.W_e(E_prime)
+                for layer in self.encoder_layers:
+                    h_V_prime, h_E_prime = layer(h_V_prime, h_E_prime, E_idx, mask, mask_attend)
+
+                # Compute categorical Jacobian
+                J_row = torch.linalg.vector_norm(h_V_prime - h_V, dim=-1) / categorical_jacobian_eps # [B, L]
+                J[i, :] = J_row
+        ####################################################################
 
         # Concatenate sequence embeddings for autoregressive decoder
         h_S = self.W_s(S)
@@ -467,6 +525,10 @@ class ProteinModel(nn.Module):
 
         logits = self.W_out(h_V)
         log_probs = F.log_softmax(logits, dim=-1)
+
+        if compute_categorical_jacobian:
+            return log_probs, J
+        
         return log_probs
 
 
