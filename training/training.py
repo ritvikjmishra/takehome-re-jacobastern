@@ -120,7 +120,7 @@ def training_loop(
         f.write(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}\n')
     print(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}')
     
-    if args.compute_categorical_jacobian:
+    if args.compute_categorical_jacobian and e % 10 == 0:
         # visualize categorical jacobian
         for i in range(len(cat_jac)):
             # Display categorical jacobian next to contact map
@@ -130,8 +130,9 @@ def training_loop(
             ax[1].imshow(cat_jac_contact_maps[i])
             ax[1].set_title(f'Contact Map for PDB {cat_jac_pdb_ids[i]}')
             model_name = "cross_attention" if args.decoder_use_full_cross_attention else "message_passing"
-            save_path = os.path.join(base_folder, "categorical_jacobian", model_name, f'epoch_{e}.png')
-            os.makedirs(save_path, exist_ok=True)
+            save_dir = os.path.join(base_folder, "categorical_jacobian", model_name)
+            save_path = os.path.join(save_dir, f'epoch_{e}.png')
+            os.makedirs(save_dir, exist_ok=True)
             plt.savefig(save_path)
 
 
