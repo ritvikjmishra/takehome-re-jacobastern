@@ -8,15 +8,18 @@ import torch
 from torch import optim
 from torch.utils.data import DataLoader
 import queue
+from tqdm import tqdm
 import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import random
 import os.path
 import subprocess
+import matplotlib.pyplot as plt
 from concurrent.futures import ProcessPoolExecutor
 from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader
 from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinModel
+from torch.profiler import profile, ProfilerActivity
 
 
 def training_loop(
@@ -27,6 +30,7 @@ def training_loop(
         loader_valid,
         device,
         optimizer,
+        scaler,
         total_step,
         logfile,
         base_folder,
@@ -35,23 +39,33 @@ def training_loop(
     model.train()
     train_sum, train_weights = 0., 0.
     train_acc = 0.
-
-    for _, batch in enumerate(loader_train):
+    for _, batch in enumerate(tqdm(loader_train)):
         start_batch = time.time()
         X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
         elapsed_featurize = time.time() - start_batch
         optimizer.zero_grad()
         mask_for_loss = mask*chain_M
+        if args.mixed_precision:
+            with torch.cuda.amp.autocast():
+                log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+                _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
+    
+            scaler.scale(loss_av_smoothed).backward()
+                
+            if args.gradient_norm > 0.0:
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
 
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+            _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
+            loss_av_smoothed.backward()
 
-        log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
-        _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
-        loss_av_smoothed.backward()
+            if args.gradient_norm > 0.0:
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
 
-        if args.gradient_norm > 0.0:
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
-
-        optimizer.step()
+            optimizer.step()
 
         loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
 
@@ -65,8 +79,21 @@ def training_loop(
     with torch.no_grad():
         validation_sum, validation_weights = 0., 0.
         validation_acc = 0.
-        for _, batch in enumerate(loader_valid):
+        for i, batch in enumerate(loader_valid):
             X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
+            ########################################################
+            # Jacob
+            if e % 10 == 0 and i == 0 and args.compute_categorical_jacobian:
+                first_non_zero_coord = 10
+                max_jacobian_size = 50
+                _, cat_jac = model(X[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], S[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], mask[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], chain_M[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], residue_idx[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], chain_encoding_all[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size], compute_categorical_jacobian=True)
+                cat_jac_pdb_ids = [item["name"] for item in batch]
+                # Make contact map from X
+                dist = torch.norm(X[:, first_non_zero_coord:first_non_zero_coord + max_jacobian_size, None, 0, :3] - X[:, None, first_non_zero_coord:first_non_zero_coord + max_jacobian_size, 0, :3], dim=-1)
+                cat_jac_contact_maps = dist < 10.0
+                cat_jac = cat_jac.cpu().numpy()
+                cat_jac_contact_maps = cat_jac_contact_maps.cpu().numpy()
+            ########################################################
             log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
             mask_for_loss = mask*chain_M
             loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
@@ -92,6 +119,22 @@ def training_loop(
     with open(logfile, 'a') as f:
         f.write(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}\n')
     print(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}')
+    
+    if args.compute_categorical_jacobian and e % 10 == 0:
+        # visualize categorical jacobian
+        for i in range(len(cat_jac)):
+            # Display categorical jacobian next to contact map
+            fig, ax = plt.subplots(1, 2)
+            ax[0].imshow(cat_jac[i])
+            ax[0].set_title(f'Categorical Jacobian for PDB {cat_jac_pdb_ids[i]}')
+            ax[1].imshow(cat_jac_contact_maps[i])
+            ax[1].set_title(f'Contact Map for PDB {cat_jac_pdb_ids[i]}')
+            model_name = "cross_attention" if args.decoder_use_full_cross_attention else "message_passing"
+            save_dir = os.path.join(base_folder, "categorical_jacobian", model_name)
+            save_path = os.path.join(save_dir, f'epoch_{e}.png')
+            os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(save_path)
+
 
     checkpoint_filename_last = base_folder+'model_weights/epoch_last.pt'.format(e+1, total_step)
     torch.save({
@@ -178,7 +221,9 @@ def main(args):
                         num_decoder_layers=args.num_encoder_layers, 
                         k_neighbors=args.num_neighbors, 
                         dropout=args.dropout, 
-                        augment_eps=args.backbone_noise)
+                        augment_eps=args.backbone_noise,
+                        decoder_use_full_cross_attention=args.decoder_use_full_cross_attention,
+                        cross_attention_num_heads=args.cross_attention_num_heads)
     model.to(device)
 
 
@@ -190,13 +235,14 @@ def main(args):
     else:
         total_step = 0
         epoch = 0
+    
+    scaler = torch.cuda.amp.GradScaler()
 
     optimizer = get_std_opt(model.parameters(), args.hidden_dim, total_step)
 
 
     if PATH:
         optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
 
     with ProcessPoolExecutor(max_workers=12) as executor:
         q = queue.Queue(maxsize=3)
@@ -227,19 +273,44 @@ def main(args):
                     q.put_nowait(executor.submit(get_pdbs, train_loader, 1, args.max_protein_length, args.num_examples_per_epoch))
                     p.put_nowait(executor.submit(get_pdbs, valid_loader, 1, args.max_protein_length, args.num_examples_per_epoch))
                 reload_c += 1
-
-            total_step = training_loop(
-                e,
-                model,
-                args,
-                loader_train,
-                loader_valid,
-                device,
-                optimizer,
-                total_step,
-                logfile,
-                base_folder,
-            )
+            
+            if args.debug:
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
+                            record_shapes=True,
+                            with_stack=True) as prof:
+                    total_step = training_loop(
+                        e,
+                        model,
+                        args,
+                        loader_train,
+                        loader_valid,
+                        device,
+                        optimizer,
+                        scaler,
+                        total_step,
+                        logfile,
+                        base_folder,
+                    )
+                # Generate and save text report
+                report = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+                print(report)  # Print the report to the console
+                # Optionally, write the report to a file
+                with open('profiler_report.txt', 'w') as f:
+                    f.write(report)
+            else:
+                total_step = training_loop(
+                    e,
+                    model,
+                    args,
+                    loader_train,
+                    loader_valid,
+                    device,
+                    optimizer,
+                    scaler,
+                    total_step,
+                    logfile,
+                    base_folder,
+                )
 
 
 
